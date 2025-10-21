@@ -624,8 +624,8 @@ class LLMAnalysis:
                 tp_size, memory_attn_compute)
 
         activation_memory_per_layer_attn = (
-            seq_len * batch_size * hidden_dim / sp_size +
-            4 * seq_len * batch_size * hidden_dim /
+            seq_len * batch_size * hidden_dim / sp_size +  # Input
+            4 * seq_len * batch_size * hidden_dim /  # QKV + O
             tp_size) * bytes_per_activation + memory_attn_compute
 
         if attn_dropout:
@@ -1483,6 +1483,69 @@ class LLMAnalysis:
     def get_latency_weight_update(self, ):
         return self.weight_grad_op_state_memory_per_gpu / (
             self.get_gpu_hbm_bandwidth() * 10**9)
+    
+    def get_memory_access_per_layer_attn(
+        self,
+        batch_size: int,
+        seq_len: int,
+        is_inference: bool = True,
+        flash_attn: bool = True,
+        softmax_dropout: bool = False,
+        attn_dropout: bool = True,
+        activation_recomputation:
+        ActivationRecomputation = ActivationRecomputation.NONE,
+    ) -> float:
+        """Get the memory access (in bytes) of the attention module.
+
+        Returns:
+            float: the memory access in a transformer layer
+        """
+        tp_size = self.parallelism_config.tp_size
+        sp_size = self.parallelism_config.sp_size
+        hidden_dim = self.model_config.hidden_dim
+        n_head = self.model_config.n_head
+        bytes_per_weight = self.dtype_config.weight_bits / BITS_PER_BYTE
+        bytes_per_activation = self.dtype_config.activation_bits / BITS_PER_BYTE
+
+        if is_inference:
+            assert activation_recomputation == ActivationRecomputation.NONE, f'Inference does not need activation recomputation, but got activation_recomputation = {activation_recomputation}'
+        
+        weight_memory_access = self.get_num_params_per_layer_attn() * bytes_per_weight
+
+        if is_inference:
+            if flash_attn:
+                memory_access_per_layer_attn = (
+                    9 * batch_size * hidden_dim / tp_size +
+                    2 * seq_len * batch_size * hidden_dim / tp_size +
+                    2 * seq_len * batch_size * n_head /
+                    tp_size) * bytes_per_activation + weight_memory_access
+            else:
+                memory_access_per_layer_attn = (
+                    10 * batch_size * hidden_dim / tp_size +
+                    2 * seq_len * batch_size * hidden_dim / tp_size +
+                    2 * seq_len * batch_size * n_head / 
+                    tp_size) * bytes_per_activation + weight_memory_acces
+            return memory_access_per_layer_attn
+
+        if activation_recomputation >= ActivationRecomputation.NORM_ATTN_NORM:
+            return weight_memory_access
+        elif activation_recomputation == activation_recomputation.NONE:
+            if flash_attn:
+                memory_access_per_layer_attn = (
+                    9 * seq_len * batch_size * hidden_dim /tp_size +
+                    4 * n_head * seq_len**2 * batch_size / 
+                    tp_size) * bytes_per_activation + weight_memory_access
+            else:
+                memory_access_per_layer_attn = (
+                    12 * seq_len * batch_size * hidden_dim / tp_size + 
+                    4 * n_head * seq_len**2 * batch_size / 
+                    tp_size) * bytes_per_activation + weight_memory_access
+        
+        # if attn_dropout:
+        #     memory_access_per_layer_attn += (n_head * seq_len**2 * 
+        #         batch_size / tp_size) * (2 * bytes_per_activation + 1)
+
+        return memory_access_per_layer_attn
 
     def print_config(self, name="Training Configs") -> None:
         config_str = f"\n{name.center(PRINT_LINE_WIDTH, '-')}\n"
