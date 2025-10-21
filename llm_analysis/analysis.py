@@ -1507,43 +1507,61 @@ class LLMAnalysis:
         bytes_per_weight = self.dtype_config.weight_bits / BITS_PER_BYTE
         bytes_per_activation = self.dtype_config.activation_bits / BITS_PER_BYTE
 
-        if is_inference:
-            assert activation_recomputation == ActivationRecomputation.NONE, f'Inference does not need activation recomputation, but got activation_recomputation = {activation_recomputation}'
-        
         weight_memory_access = self.get_num_params_per_layer_attn() * bytes_per_weight
 
         if is_inference:
+            assert activation_recomputation == ActivationRecomputation.NONE, (
+                f'Inference does not need activation recomputation, but got activation_recomputation = {activation_recomputation}'
+            )
+
+        if is_inference:
             if flash_attn:
-                memory_access_per_layer_attn = (
+                memory_access = (
+                    2 * batch_size * hidden_dim / sp_size +
                     9 * batch_size * hidden_dim / tp_size +
                     2 * seq_len * batch_size * hidden_dim / tp_size +
-                    2 * seq_len * batch_size * n_head /
-                    tp_size) * bytes_per_activation + weight_memory_access
+                    2 * seq_len * batch_size * n_head / tp_size
+                ) * bytes_per_activation + weight_memory_access
             else:
-                memory_access_per_layer_attn = (
+                memory_access = (
+                    2 * batch_size * hidden_dim / sp_size +
                     10 * batch_size * hidden_dim / tp_size +
                     2 * seq_len * batch_size * hidden_dim / tp_size +
-                    2 * seq_len * batch_size * n_head / 
-                    tp_size) * bytes_per_activation + weight_memory_acces
-            return memory_access_per_layer_attn
-
+                    4 * seq_len * batch_size * n_head / tp_size
+                ) * bytes_per_activation + weight_memory_access
+            if softmax_dropout:
+                memory_access += (
+                    n_head * seq_len * batch_size / tp_size
+                ) * (2 * bytes_per_activation + 2)
+            return memory_access
+    
         if activation_recomputation >= ActivationRecomputation.NORM_ATTN_NORM:
             return weight_memory_access
         elif activation_recomputation == activation_recomputation.NONE:
             if flash_attn:
-                memory_access_per_layer_attn = (
+                memory_access = (
+                    2 * seq_len * batch_size * hidden_dim / sp_size +
                     9 * seq_len * batch_size * hidden_dim /tp_size +
-                    4 * n_head * seq_len**2 * batch_size / 
-                    tp_size) * bytes_per_activation + weight_memory_access
+                    4 * n_head * seq_len**2 * batch_size / tp_size
+                ) * bytes_per_activation + weight_memory_access
             else:
-                memory_access_per_layer_attn = (
-                    12 * seq_len * batch_size * hidden_dim / tp_size + 
-                    4 * n_head * seq_len**2 * batch_size / 
-                    tp_size) * bytes_per_activation + weight_memory_access
-        
-        # if attn_dropout:
-        #     memory_access_per_layer_attn += (n_head * seq_len**2 * 
-        #         batch_size / tp_size) * (2 * bytes_per_activation + 1)
+                memory_access = (
+                    2 * seq_len * batch_size * hidden_dim / sp_size +
+                    12 * seq_len * batch_size * hidden_dim /tp_size +
+                    4 * n_head * seq_len**2 * batch_size / tp_size
+                ) * bytes_per_activation + weight_memory_access
+            if softmax_dropout:
+                memory_access += (
+                    n_head * seq_len**2 * batch_size / tp_size
+                ) * (2 * bytes_per_activation + 2)
+            if attn_dropout:
+                memory_access_per_layer_attn += (
+                    seq_len * batch_size * hidden_dim / sp_size
+                ) * (2 * bytes_per_activation + 2)
+        else:
+            raise ValueError(
+                f'Invalid activation_recomputation: {activation_recomputation}'
+            )
 
         return memory_access_per_layer_attn
 
@@ -2318,6 +2336,12 @@ class LLMAnalysis:
             f" {_num_to_string(num_flops_total_per_micro_batch, divisor=1000)} ({_num_to_string(num_flops_fwd_total, divisor=1000)} fwd"
             f" + {_num_to_string(num_flops_bwd_total, divisor=1000)} bwd +"
             f" {_num_to_string(num_flops_recompute, divisor=1000)} recompute)")
+        
+        # memory access for attention per layer
+        memory_access_per_layer_attn = self.get_memory_access_per_layer_attn(
+            batch_size_per_gpu, seq_len, is_inference=False,
+            flash_attn=flash_attn, softmax_dropout=softmax_dropout,
+            attn_dropout=True, activation_recomputation=activation_recomputation)
 
         # estimated by flops only:
         latency_per_micro_batch_using_flops = num_flops_total_per_micro_batch / (
@@ -2537,6 +2561,8 @@ class LLMAnalysis:
             optimizer_state_memory_per_gpu + weight_memory_per_gpu +
             max(activation_memory_per_gpu, gradient_memory_per_gpu) +
             max(estimated_bwd_prefetch_memory_per_gpu, loss_bwd_memory),
+            "memory_access_per_layer_attn": 
+            memory_access_per_layer_attn,
             "latency_per_micro_batch":
             latency_per_micro_batch,
             "latency_fwd":
