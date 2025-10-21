@@ -62,6 +62,7 @@ class ModelConfig:
     moe_num_experts: int = 1  # number of experts for mixture of experts model
     moe_top_k: int = 1  # top k experts for mixture of experts model
     mlp_gated_linear_units: bool = False  # whether to use gated linear units for MLP
+    tie_word_embedding: bool = True  # whether the model's input and output word embeddings should be tied. Note that this is only relevant if the model has a output word embedding layer.
 
     def __post_init__(self):
         if self.ffn_embed_dim is None and self.expansion_ratio is None:
@@ -89,11 +90,14 @@ class GPUConfig:
     intra_node_bandwidth_in_GB_per_sec: float  # intra node GPU bandwidth in GB/s
     intra_node_min_message_latency: float  # minimum intra node message latency in seconds
     peak_fp16_TFLOPS: float  # peak Tensor TFLOPS for FP16
+    peak_fp32_TFLOPS: float = None  # peak Tensor TFLOPS for FP32
     peak_i8_TFLOPS: float = None  # peak Tensor TFLOPS for INT8
     peak_i4_TFLOPS: float = None  # peak Tensor TFLOPS for INT4
     inter_node_bandwidth_in_GB_per_sec: float = 200  # inter node bandwidth in GB/s, assuming Mellanox 200Gbps HDR Infiniband
 
     def __post_init__(self):
+        if self.peak_fp32_TFLOPS is None:
+            self.peak_fp32_TFLOPS = 0.5 * self.peak_fp16_TFLOPS
         if self.peak_i8_TFLOPS is None:
             self.peak_i8_TFLOPS = 2 * self.peak_fp16_TFLOPS
         if self.peak_i4_TFLOPS is None:
@@ -364,18 +368,38 @@ def get_model_config_by_name(name_or_path: str) -> ModelConfig:
     return model_config
 
 
-def get_gpu_config_by_name(name: str) -> GPUConfig:
-    """Get gpu config from the populated mapping by name."""
-    if name not in gpu_configs:
-        raise ValueError(f"unknown gpu config name: {name}")
-    return gpu_configs[name]
+def get_gpu_config_by_name(name_or_path: str) -> GPUConfig:
+    """Get gpu config from the populated mapping by name, or from gpu config json file path."""
+    if name_or_path in gpu_configs:
+        return gpu_configs[name_or_path]
+    if os.path.isfile(name_or_path) and ".json" in name_or_path:
+        try:
+            with open(name_or_path, "r") as f:
+                config_json = json.load(f)
+            config = GPUConfig(**config_json)
+            if config.name not in gpu_configs:
+                gpu_configs[config.name] = config
+            return config
+        except Exception as e:
+            raise ValueError(f"unknown gpu config name: {e}")
+    raise ValueError(f"unknown gpu config name: {name_or_path}")
 
 
-def get_dtype_config_by_name(name: str) -> DtypeConfig:
-    """Get data type config from the populated mapping by name."""
-    if name not in dtype_configs:
-        raise ValueError(f"unknown quant config name: {name}")
-    return dtype_configs[name]
+def get_dtype_config_by_name(name_or_path: str) -> DtypeConfig:
+    """Get data type config from the populated mapping by name, or from data type config json file path."""
+    if name_or_path in dtype_configs:
+        return dtype_configs[name_or_path]
+    if os.path.isfile(name_or_path) and ".json" in name_or_path:
+        try:
+            with open(name_or_path, "r") as f:
+                config_json = json.load(f)
+            config = DtypeConfig(**config_json)
+            if config.name not in dtype_configs:
+                dtype_configs[config.name] = config
+            return config
+        except Exception as e:
+            raise ValueError(f"unknown quant config name: {e}")
+    raise ValueError(f"unknown gpu config name: {name_or_path}")
 
 
 def dump_model_config_by_name(name: str,

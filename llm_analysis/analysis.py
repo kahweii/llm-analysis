@@ -228,10 +228,12 @@ class LLMAnalysis:
             gemm_TFOPS = self.gpu_config.peak_i4_TFLOPS
         elif higher_bits == 8:
             gemm_TFOPS = self.gpu_config.peak_i8_TFLOPS
-        else:
-            assert (higher_bits == 16
-                    ), "weight_bits and activation_bits must be 4, 8, or 16"
+        elif higher_bits == 16:
             gemm_TFOPS = self.gpu_config.peak_fp16_TFLOPS
+        else:
+            assert (higher_bits == 32
+                    ), "weight_bits and activation_bits must be 4, 8, 16 or 32"
+            gemm_TFOPS = self.gpu_config.peak_fp32_TFLOPS
         return gemm_TFOPS * self.flops_efficiency
 
     def get_pivot(self) -> float:
@@ -541,7 +543,8 @@ class LLMAnalysis:
             float: the memory (in bytes) required to store the embedding layer
         """
         dtype_bytes = self.dtype_config.embedding_bits / BITS_PER_BYTE
-        memory_embedding = (self.get_num_params_embedding() /
+        memory_embedding = (self.get_num_params_embedding(
+                            self.model_config.tie_word_embedding) /
                             self.parallelism_config.tp_size) * dtype_bytes
         if not is_sharded:
             return memory_embedding
