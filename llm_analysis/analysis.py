@@ -2111,6 +2111,110 @@ class LLMAnalysis:
             gradient_accumulation_steps,
             global_batch_size,
         )
+    
+    def get_max_seq_len_for_training(
+        self,
+        batch_size_per_gpu: int,
+        activation_recomputation: 
+        ActivationRecomputation = ActivationRecomputation.NONE,
+        layernorm_dtype_bytes: int = BYTES_FP32,
+        master_weights_dtype_bytes: int = BYTES_FP32,
+        other_op_bytes: int = None,
+        flash_attn: bool = False,
+        softmax_dropout: bool = False,
+        mlp_activation_quant_bits: int = None,
+        mlp_1linear_quant_bits: int = None,
+        mlp_gelu_input_quant_bits: int = None,
+        mlp_2linear_quant_bits: int = None,
+        mlp_recompute_gelu: bool = False,
+        ds_zero: DSZeRO = DSZeRO.NONE,
+        fwd_prefetch: bool = True,
+        bwd_prefetch: bool = True,
+        upper_bound: int = None,
+    ) -> dict:
+        """Estimate the maximum sequence length (seq_len) that can fit into the 
+        memory of a single GPU during training.
+        
+        Returns:
+            dict: a dict containing :
+            int: the largetst sequence length that fits into GPU memory
+            float: estimated memory usage (in bytes) at this seq_len
+            bool: whether the configuration fits at all
+        """
+        max_allow = int(self.model_config.max_seq_len or (upper_bound or 65536))
+        if upper_bound:
+            max_allow = min(max_allow, upper_bound)
+        
+        num_layers_per_gpu = int(self.model_config.num_layers / 
+                                 self.parallelism_config.pp_size)
+        # weight memory per gpu
+        weight_embedding = self.get_memory_embedding(ds_zero)
+        weight_per_layer, _, _, _ = self.get_weight_memory_per_layer(
+            is_sharded=True, ds_zero=ds_zero, return_breakdown=True)
+        weight_last_ln = self.get_weight_memory_last_layernorm(ds_zero)
+        weight_per_gpu = weight_embedding + weight_per_layer * num_layers_per_gpu + weight_last_ln
+
+        # optimizer memory per gpu
+        optimizer_state_per_layer, _ = self.get_memory_optimizer_state_and_gradient_per_layer(
+            master_weights_dtype_bytes, other_op_bytes, ds_zero)
+        optimizer_state_embedding, _ = self.get_memory_optimizer_state_and_gradient_embedding(
+            master_weights_dtype_bytes, other_op_bytes, ds_zero)
+        optimizer_state_last_ln, _ = self.get_memory_optimizer_state_and_gradient_last_layernorm(
+            master_weights_dtype_bytes, other_op_bytes, ds_zero)
+        optimizer_state_per_gpu = optimizer_state_per_layer * num_layers_per_gpu + optimizer_state_embedding + optimizer_state_last_ln
+
+        # base memory left (weight + optimizer substracted)
+        total_mem = self.gpu_config.mem_per_GPU_in_GB * 1024**3
+        memory_left_base = total_mem - weight_per_gpu - optimizer_state_per_gpu
+        if memory_left_base <= 0:
+            return {"max_seq_len": 0, "required_memory_B": weight_per_gpu + optimizer_state_per_gpu, "fit": False}
+        
+        # unshared weight per layer used for prefetch estimate
+        unsharded_weight_embedding = self.get_memory_embedding(ds_zero, is_sharded=False)
+        unsharded_weight_per_layer, _, _, _ = self.get_weight_memory_per_layer(
+            is_sharded=False, ds_zero=ds_zero, return_breakdown=True)
+        est_fwd_prefetch = unsharded_weight_embedding + unsharded_weight_per_layer
+        est_bwd_prefetch = (int(fwd_prefetch) + int(bwd_prefetch)) * unsharded_weight_per_layer
+        est_prefetch = max(est_fwd_prefetch, est_bwd_prefetch)
+
+        def fits(seq_len: int):
+            act_per_layer, _, _, _ = self.get_activation_memory_per_layer(
+                batch_size_per_gpu,
+                seq_len,
+                is_inference=False,
+                activation_recomputation=activation_recomputation,
+                layernorm_dtype_bytes=layernorm_dtype_bytes,
+                flash_attn=flash_attn,
+                softmax_dropout=softmax_dropout,
+                mlp_activation_quant_bits=mlp_activation_quant_bits,
+                mlp_1linear_quant_bits=mlp_1linear_quant_bits,
+                mlp_gelu_input_quant_bits=mlp_gelu_input_quant_bits,
+                mlp_2linear_quant_bits=mlp_2linear_quant_bits,
+                mlp_recompute_gelu=mlp_recompute_gelu,
+                return_breakdown=True,
+            )
+            act_per_gpu = act_per_layer * self.model_config.num_layers
+            act_per_gpu += self.get_activation_memory_input_embedding(batch_size_per_gpu, seq_len)
+            act_per_gpu += self.get_activation_memory_output_embedding(batch_size_per_gpu, seq_len)
+            act_per_gpu += self.get_activation_memory_per_layernorm(batch_size_per_gpu, seq_len, layernorm_dtype_bytes)
+
+            loss_bwd = self.get_loss_bwd_memory(batch_size_per_gpu, seq_len)
+            required = act_per_gpu + max(est_prefetch, loss_bwd)
+            fit = memory_left_base >= required
+            return fit, required
+        
+        lo, hi = 1, max_allow
+        best, best_req = 0, 0.0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            ok, req = fits(mid)
+            if ok:
+                best, best_req = mid, req
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        return {"max_seq_len": best, "estimated_peak_memory_per_gpu": best_req + weight_per_gpu + optimizer_state_per_gpu, "fit": best > 0}
 
     def training(
         self,
