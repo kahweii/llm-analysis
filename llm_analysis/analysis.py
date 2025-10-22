@@ -1632,7 +1632,67 @@ class LLMAnalysis:
             memory_access = access_1linear_total + access_2linear_total + access_gelu_in + access_gelu_out
 
         return memory_access
+    
+    def get_arithmetic_intensity_per_layer(
+        self,
+        batch_size: int,
+        seq_len: int,
+        is_inference: bool = False,
+        activation_recomputation: 
+        ActivationRecomputation = ActivationRecomputation.NONE,
+        flash_attn: bool = False,
+        softmax_dropout: bool = False,
+        mlp_activation_quant_bits: int = None,
+        mlp_1linear_quant_bits: int = None, 
+        mlp_gelu_input_quant_bits: int = None,
+        mlp_2linear_quant_bits: int = None,
+        mlp_recompute_gelu: bool = False,
+    ) -> dict:
+        """Calculate arithmetic intensity (FLOPS/byte) for attention and FFN modules.
+    
+        Returns:
+            A dict contains arithmetic intensity for attention and FFN modules.
+        """
+        attn_flops = self.get_num_flops_fwd_per_layer_attn(batch_size, seq_len)
+        mlp_flops = self.get_num_flops_fwd_per_layer_mlp(batch_size, seq_len)
 
+        attn_memory_access = self.get_memory_access_per_layer_attn(
+            batch_size, 
+            seq_len,
+            is_inference=is_inference,
+            flash_attn=flash_attn,
+            softmax_dropout=softmax_dropout,
+            activation_recomputation=activation_recomputation
+        )
+
+        mlp_memory_access = self.get_memory_access_per_layer_mlp(
+            batch_size,
+            seq_len, 
+            is_inference=is_inference,
+            activation_recomputation=activation_recomputation,
+            mlp_activation_quant_bits=mlp_activation_quant_bits,
+            mlp_1linear_quant_bits=mlp_1linear_quant_bits,
+            mlp_gelu_input_quant_bits=mlp_gelu_input_quant_bits,
+            mlp_2linear_quant_bits=mlp_2linear_quant_bits,
+            recompute_gelu=mlp_recompute_gelu,
+            gated_linear_units=self.model_config.mlp_gated_linear_units,
+        )
+
+        attn_arithmetic_intensity = attn_flops / attn_memory_access
+        mlp_arithmetic_intensity = mlp_flops / mlp_memory_access
+
+        return {
+            "attention": {
+                "flops": attn_flops,
+                "memory_access_bytes": attn_memory_access,
+                "arithmetic_intensity": attn_arithmetic_intensity
+            },
+            "ffn": {
+                "flops": mlp_flops, 
+                "memory_access_bytes": mlp_memory_access,
+                "arithmetic_intensity": mlp_arithmetic_intensity
+            }
+        }
 
     def print_config(self, name="Training Configs") -> None:
         config_str = f"\n{name.center(PRINT_LINE_WIDTH, '-')}\n"
@@ -2167,7 +2227,7 @@ class LLMAnalysis:
         total_mem = self.gpu_config.mem_per_GPU_in_GB * 1024**3
         memory_left_base = total_mem - weight_per_gpu - optimizer_state_per_gpu
         if memory_left_base <= 0:
-            return {"max_seq_len": 0, "required_memory_B": weight_per_gpu + optimizer_state_per_gpu, "fit": False}
+            return {"max_seq_len": 0, "peak_memory_per_gpu": 0, "fit": False}
         
         # unshared weight per layer used for prefetch estimate
         unsharded_weight_embedding = self.get_memory_embedding(ds_zero, is_sharded=False)
@@ -2214,7 +2274,7 @@ class LLMAnalysis:
             else:
                 hi = mid - 1
 
-        return {"max_seq_len": best, "estimated_peak_memory_per_gpu": best_req + weight_per_gpu + optimizer_state_per_gpu, "fit": best > 0}
+        return {"max_seq_len": best, "peak_memory_per_gpu": best_req + weight_per_gpu + optimizer_state_per_gpu, "fit": best > 0}
 
     def training(
         self,
