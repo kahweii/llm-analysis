@@ -1495,10 +1495,11 @@ class LLMAnalysis:
         activation_recomputation:
         ActivationRecomputation = ActivationRecomputation.NONE,
     ) -> float:
-        """Get the memory access (in bytes) of the attention module.
+        """Get the memory access (in bytes) of the attention in a transformer 
+        layer.
 
         Returns:
-            float: the memory access in a transformer layer
+            float: the memory access (in bytes) of the attention in a transformer layer
         """
         tp_size = self.parallelism_config.tp_size
         sp_size = self.parallelism_config.sp_size
@@ -1507,7 +1508,7 @@ class LLMAnalysis:
         bytes_per_weight = self.dtype_config.weight_bits / BITS_PER_BYTE
         bytes_per_activation = self.dtype_config.activation_bits / BITS_PER_BYTE
 
-        weight_memory_access = self.get_num_params_per_layer_attn() * bytes_per_weight
+        weight_memory_access = self.get_num_params_per_layer_attn() / tp_size * bytes_per_weight
 
         if is_inference:
             assert activation_recomputation == ActivationRecomputation.NONE, (
@@ -1517,21 +1518,21 @@ class LLMAnalysis:
         if is_inference:
             if flash_attn:
                 memory_access = (
-                    2 * batch_size * hidden_dim / sp_size +
-                    9 * batch_size * hidden_dim / tp_size +
-                    2 * seq_len * batch_size * hidden_dim / tp_size +
-                    2 * seq_len * batch_size * n_head / tp_size
-                ) * bytes_per_activation + weight_memory_access
-            else:
-                memory_access = (
-                    2 * batch_size * hidden_dim / sp_size +
-                    10 * batch_size * hidden_dim / tp_size +
+                    4 * batch_size * hidden_dim / sp_size +
+                    4 * batch_size * hidden_dim / tp_size +
                     2 * seq_len * batch_size * hidden_dim / tp_size +
                     4 * seq_len * batch_size * n_head / tp_size
                 ) * bytes_per_activation + weight_memory_access
+            else:
+                memory_access = (
+                    4 * batch_size * hidden_dim / sp_size +
+                    6 * batch_size * hidden_dim / tp_size +
+                    2 * seq_len * batch_size * hidden_dim / tp_size +
+                    4 * seq_len * batch_size * n_head 
+                ) * bytes_per_activation + weight_memory_access
             if softmax_dropout:
                 memory_access += (
-                    n_head * seq_len * batch_size / tp_size
+                    n_head * seq_len * batch_size
                 ) * (2 * bytes_per_activation + 2)
             return memory_access
     
@@ -1540,22 +1541,22 @@ class LLMAnalysis:
         elif activation_recomputation == activation_recomputation.NONE:
             if flash_attn:
                 memory_access = (
-                    2 * seq_len * batch_size * hidden_dim / sp_size +
-                    9 * seq_len * batch_size * hidden_dim /tp_size +
-                    4 * n_head * seq_len**2 * batch_size / tp_size
+                    4 * seq_len * batch_size * hidden_dim / sp_size +
+                    6 * seq_len * batch_size * hidden_dim / tp_size +
+                    4 * seq_len * batch_size * n_head / tp_size
                 ) * bytes_per_activation + weight_memory_access
             else:
                 memory_access = (
-                    2 * seq_len * batch_size * hidden_dim / sp_size +
-                    12 * seq_len * batch_size * hidden_dim /tp_size +
-                    4 * n_head * seq_len**2 * batch_size / tp_size
+                    4 * seq_len * batch_size * hidden_dim / sp_size +
+                    8 * seq_len * batch_size * hidden_dim / tp_size +
+                    4 * seq_len**2 * batch_size * n_head
                 ) * bytes_per_activation + weight_memory_access
             if softmax_dropout:
                 memory_access += (
-                    n_head * seq_len**2 * batch_size / tp_size
+                    n_head * seq_len**2 * batch_size
                 ) * (2 * bytes_per_activation + 2)
             if attn_dropout:
-                memory_access_per_layer_attn += (
+                memory_access += (
                     seq_len * batch_size * hidden_dim / sp_size
                 ) * (2 * bytes_per_activation + 2)
         else:
@@ -1563,7 +1564,75 @@ class LLMAnalysis:
                 f'Invalid activation_recomputation: {activation_recomputation}'
             )
 
-        return memory_access_per_layer_attn
+        return memory_access
+    
+    def get_memory_access_per_layer_mlp(
+        self,
+        batch_size: int,
+        seq_len: int,
+        is_inference: bool = True,
+        activation_recomputation:
+        ActivationRecomputation = ActivationRecomputation.NONE,
+        mlp_activation_quant_bits: int = None,
+        mlp_1linear_quant_bits: int = None,
+        mlp_gelu_input_quant_bits: int = None,
+        mlp_2linear_quant_bits: int = None,
+        recompute_gelu: bool = False,
+        gated_linear_units: bool = False,
+        with_dropout: bool = False,
+    ) -> float:
+        """Get the memory access (in bytes) of the MLP in a transformer layer.
+
+        Returns:
+            float: the memory access (in bytes) of the MLP in a transformer layer
+        """
+        tp_size = self.parallelism_config.tp_size
+        sp_size = self.parallelism_config.sp_size
+        ep_size = self.parallelism_config.ep_size
+        hidden_dim = self.model_config.hidden_dim
+        expansion_ratio = self.model_config.expansion_ratio
+        bytes_per_weight = self.dtype_config.weight_bits / BITS_PER_BYTE
+        bytes_per_activation = self.dtype_config.activation_bits / BITS_PER_BYTE
+
+        if is_inference:
+            assert activation_recomputation == ActivationRecomputation.NONE, (
+                f'Inference does not need activation recomputation, but got activation_recomputation = {activation_recomputation}'
+            )
+
+        bytes_per_1linear_input = bytes_per_gelu_input = bytes_per_2linear_input = bytes_per_activation
+        if mlp_1linear_quant_bits:
+            bytes_per_1linear_input = mlp_1linear_quant_bits / BITS_PER_BYTE
+        if mlp_gelu_input_quant_bits:
+            bytes_per_gelu_input = mlp_gelu_input_quant_bits / BITS_PER_BYTE
+        if mlp_2linear_quant_bits:
+            bytes_per_2linear_input = mlp_2linear_quant_bits / BITS_PER_BYTE
+        if mlp_activation_quant_bits:
+            bytes_per_1linear_input = bytes_per_gelu_input = bytes_per_2linear_input = mlp_activation_quant_bits / BITS_PER_BYTE
+        
+        access_1linear_in = seq_len * batch_size * hidden_dim / sp_size * bytes_per_1linear_input
+        access_1linear_weight = hidden_dim * hidden_dim * expansion_ratio / tp_size * bytes_per_weight
+        access_1linear_out = seq_len * batch_size * hidden_dim * expansion_ratio / tp_size * bytes_per_gelu_input
+        access_1linear_total = access_1linear_in + access_1linear_weight + access_1linear_out
+
+        access_2linear_in = seq_len * batch_size * hidden_dim * expansion_ratio / tp_size * bytes_per_2linear_input
+        access_2linear_weight = hidden_dim * hidden_dim * expansion_ratio / tp_size * bytes_per_weight
+        access_2linear_out = seq_len * batch_size * hidden_dim / sp_size * bytes_per_1linear_input
+        access_2linear_total = access_2linear_in + access_2linear_weight + access_2linear_out
+
+        access_gelu_in = access_1linear_out
+        access_gelu_out = access_2linear_in
+
+        if recompute_gelu and gated_linear_units:
+            memory_access = access_1linear_total * 2 + access_2linear_total + access_gelu_in + access_gelu_out
+        elif recompute_gelu:
+            memory_access = access_1linear_total + access_2linear_total + access_gelu_in
+        elif gated_linear_units:
+            memory_access = access_1linear_total * 2 + access_2linear_total + access_gelu_in + access_gelu_out
+        else:
+            memory_access = access_1linear_total + access_2linear_total + access_gelu_in + access_gelu_out
+
+        return memory_access
+
 
     def print_config(self, name="Training Configs") -> None:
         config_str = f"\n{name.center(PRINT_LINE_WIDTH, '-')}\n"
@@ -2341,7 +2410,13 @@ class LLMAnalysis:
         memory_access_per_layer_attn = self.get_memory_access_per_layer_attn(
             batch_size_per_gpu, seq_len, is_inference=False,
             flash_attn=flash_attn, softmax_dropout=softmax_dropout,
-            attn_dropout=True, activation_recomputation=activation_recomputation)
+            activation_recomputation=activation_recomputation)
+
+        # memory access for mlp per layer
+        memory_access_per_layer_mlp = self.get_memory_access_per_layer_mlp(
+            batch_size_per_gpu, seq_len, is_inference=False,
+            activation_recomputation=activation_recomputation,
+            gated_linear_units=self.model_config.mlp_gated_linear_units)
 
         # estimated by flops only:
         latency_per_micro_batch_using_flops = num_flops_total_per_micro_batch / (
@@ -2563,6 +2638,8 @@ class LLMAnalysis:
             max(estimated_bwd_prefetch_memory_per_gpu, loss_bwd_memory),
             "memory_access_per_layer_attn": 
             memory_access_per_layer_attn,
+            "memory_access_per_layer_mlp":
+            memory_access_per_layer_mlp,
             "latency_per_micro_batch":
             latency_per_micro_batch,
             "latency_fwd":
