@@ -1655,6 +1655,7 @@ class LLMAnalysis:
         """
         attn_flops = self.get_num_flops_fwd_per_layer_attn(batch_size, seq_len)
         mlp_flops = self.get_num_flops_fwd_per_layer_mlp(batch_size, seq_len)
+        total_flops = attn_flops + mlp_flops
 
         attn_memory_access = self.get_memory_access_per_layer_attn(
             batch_size, 
@@ -1664,7 +1665,6 @@ class LLMAnalysis:
             softmax_dropout=softmax_dropout,
             activation_recomputation=activation_recomputation
         )
-
         mlp_memory_access = self.get_memory_access_per_layer_mlp(
             batch_size,
             seq_len, 
@@ -1677,9 +1677,11 @@ class LLMAnalysis:
             recompute_gelu=mlp_recompute_gelu,
             gated_linear_units=self.model_config.mlp_gated_linear_units,
         )
+        total_memory_access = attn_memory_access + mlp_memory_access
 
         attn_arithmetic_intensity = attn_flops / attn_memory_access
         mlp_arithmetic_intensity = mlp_flops / mlp_memory_access
+        total_arithmetic_intensity = total_flops / total_memory_access
 
         return {
             "attention": {
@@ -1691,6 +1693,11 @@ class LLMAnalysis:
                 "flops": mlp_flops, 
                 "memory_access_bytes": mlp_memory_access,
                 "arithmetic_intensity": mlp_arithmetic_intensity
+            },
+            "total": {
+                "flops": total_flops,
+                "memory_access_bytes": total_memory_access,
+                "arithmetic_intensity": total_arithmetic_intensity
             }
         }
 

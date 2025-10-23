@@ -94,6 +94,7 @@ class GPUConfig:
     peak_i8_TFLOPS: float = None  # peak Tensor TFLOPS for INT8
     peak_i4_TFLOPS: float = None  # peak Tensor TFLOPS for INT4
     inter_node_bandwidth_in_GB_per_sec: float = 200  # inter node bandwidth in GB/s, assuming Mellanox 200Gbps HDR Infiniband
+    price_per_card_per_hour_usd: float = 0  # estimated price on public clouds
 
     def __post_init__(self):
         if self.peak_fp32_TFLOPS is None:
