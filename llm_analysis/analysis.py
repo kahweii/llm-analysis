@@ -1489,6 +1489,8 @@ class LLMAnalysis:
         batch_size: int,
         seq_len: int,
         is_inference: bool = True,
+        is_forward: bool = True,
+        linear_qkv: bool = True,
         flash_attn: bool = True,
         softmax_dropout: bool = False,
         attn_dropout: bool = True,
@@ -1503,10 +1505,18 @@ class LLMAnalysis:
         """
         tp_size = self.parallelism_config.tp_size
         sp_size = self.parallelism_config.sp_size
+        num_heads = self.model_config.n_head
+        num_kv_heads = self.model_config.num_key_value_heads
         hidden_dim = self.model_config.hidden_dim
-        n_head = self.model_config.n_head
+        head_dim = hidden_dim / num_heads
         bytes_per_weight = self.dtype_config.weight_bits / BITS_PER_BYTE
         bytes_per_activation = self.dtype_config.activation_bits / BITS_PER_BYTE
+
+        if num_kv_heads / tp_size < 1:
+            raise ValueError(
+                f'At least one attention head required on each tensor-parallel GPU. '
+                f'num_kv_heads={num_kv_heads}, tp_size={tp_size}.'
+            )
 
         weight_memory_access = self.get_num_params_per_layer_attn() / tp_size * bytes_per_weight
 
@@ -1516,53 +1526,84 @@ class LLMAnalysis:
             )
 
         if is_inference:
-            if flash_attn:
-                memory_access = (
-                    4 * batch_size * hidden_dim / sp_size +
-                    4 * batch_size * hidden_dim / tp_size +
-                    2 * seq_len * batch_size * hidden_dim / tp_size +
-                    4 * seq_len * batch_size * n_head / tp_size
-                ) * bytes_per_activation + weight_memory_access
-            else:
-                memory_access = (
-                    4 * batch_size * hidden_dim / sp_size +
-                    6 * batch_size * hidden_dim / tp_size +
-                    2 * seq_len * batch_size * hidden_dim / tp_size +
-                    4 * seq_len * batch_size * n_head 
-                ) * bytes_per_activation + weight_memory_access
-            if softmax_dropout:
-                memory_access += (
-                    n_head * seq_len * batch_size
-                ) * (2 * bytes_per_activation + 2)
-            return memory_access
-    
-        if activation_recomputation >= ActivationRecomputation.NORM_ATTN_NORM:
-            return weight_memory_access
-        elif activation_recomputation == activation_recomputation.NONE:
-            if flash_attn:
-                memory_access = (
-                    4 * seq_len * batch_size * hidden_dim / sp_size +
-                    6 * seq_len * batch_size * hidden_dim / tp_size +
-                    4 * seq_len * batch_size * n_head / tp_size
-                ) * bytes_per_activation + weight_memory_access
-            else:
-                memory_access = (
-                    4 * seq_len * batch_size * hidden_dim / sp_size +
-                    8 * seq_len * batch_size * hidden_dim / tp_size +
-                    4 * seq_len**2 * batch_size * n_head
-                ) * bytes_per_activation + weight_memory_access
-            if softmax_dropout:
-                memory_access += (
-                    n_head * seq_len**2 * batch_size
-                ) * (2 * bytes_per_activation + 2)
-            if attn_dropout:
-                memory_access += (
-                    seq_len * batch_size * hidden_dim / sp_size
-                ) * (2 * bytes_per_activation + 2)
+            pass
+        
+        if tp_size > 1 and tp_size == sp_size:
+            seq_len = seq_len / sp_size
         else:
             raise ValueError(
-                f'Invalid activation_recomputation: {activation_recomputation}'
+                f'Sequence parallelism is gated by tensor parallelism. '
+                f'tp_size must > 1'
             )
+    
+        access_linear_qkv = (
+            seq_len * batch_size * hidden_dim
+            * bytes_per_activation
+            + (num_heads + 2 * num_kv_heads) * head_dim / tp_size * hidden_dim
+            * bytes_per_weight
+            + seq_len * batch_size * (num_heads + 2 * num_kv_heads) * head_dim / tp_size
+            * bytes_per_activation
+        )
+        access_q_proj = (
+            seq_len * batch_size * hidden_dim
+            * bytes_per_activation
+            + hidden_dim * (hidden_dim / tp_size)
+            * bytes_per_weight
+            + seq_len * batch_size * (num_heads / tp_size) * head_dim
+            * bytes_per_activation
+        )
+        access_kv_proj = (
+            seq_len * batch_size * hidden_dim
+            * bytes_per_activation
+            + hidden_dim * (num_kv_heads * head_dim / tp_size)
+            * bytes_per_weight
+            + seq_len * batch_size * (num_kv_heads / tp_size) * head_dim
+            * bytes_per_activation
+        )
+        access_kv_repeat = (
+            2 * seq_len * batch_size * (num_kv_heads / tp_size) * head_dim
+            + 2 * seq_len * batch_size * (num_heads / tp_size) * head_dim
+        ) * bytes_per_activation
+        access_qk_matmul = (
+            seq_len * batch_size * (num_heads / tp_size) * head_dim
+            + seq_len * batch_size * (num_heads / tp_size) * head_dim
+            + batch_size * (num_heads / tp_size) * seq_len * seq_len
+        ) * bytes_per_activation
+        access_softmax = (
+            2 * batch_size * (num_heads / tp_size) * seq_len * seq_len
+        ) * bytes_per_activation
+        access_softmax_dropout = (
+            2 * batch_size * (num_heads / tp_size) * seq_len * seq_len
+        ) * bytes_per_activation
+        access_sv_matmul = (
+            batch_size * (num_heads / tp_size) * seq_len * seq_len
+            + seq_len * batch_size * (num_heads / tp_size) * head_dim
+            + seq_len * batch_size * (num_heads / tp_size) * head_dim
+        ) * bytes_per_activation
+        access_o_proj = (
+            seq_len * batch_size * (num_heads / tp_size) * head_dim
+            * bytes_per_activation
+            + hidden_dim * (hidden_dim / tp_size)
+            * bytes_per_weight
+            + seq_len * batch_size * hidden_dim 
+            * bytes_per_activation
+        )
+
+        if is_forward:
+            memory_access = (
+                access_linear_qkv if linear_qkv else (
+                    access_q_proj
+                    + 2 * access_kv_proj
+                )
+                + access_kv_repeat if num_kv_heads < num_heads else 0
+                + access_qk_matmul 
+                + access_softmax
+                + access_softmax_dropout
+                + access_sv_matmul
+                + access_o_proj
+            )
+        else:
+            pass
 
         return memory_access
     
