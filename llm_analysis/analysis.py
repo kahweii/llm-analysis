@@ -1484,13 +1484,11 @@ class LLMAnalysis:
         return self.weight_grad_op_state_memory_per_gpu / (
             self.get_gpu_hbm_bandwidth() * 10**9)
     
-    def get_memory_access_per_layer_attn(
+    def get_memory_access_fwd_per_layer_attn(
         self,
         batch_size: int,
         seq_len: int,
         is_inference: bool = True,
-        is_forward: bool = True,
-        linear_qkv: bool = True,
         flash_attn: bool = True,
         softmax_dropout: bool = False,
         attn_dropout: bool = True,
@@ -1507,6 +1505,7 @@ class LLMAnalysis:
         sp_size = self.parallelism_config.sp_size
         num_heads = self.model_config.n_head
         num_kv_heads = self.model_config.num_key_value_heads
+        num_kv_groups = self.model_config.num_key_value_groups
         hidden_dim = self.model_config.hidden_dim
         head_dim = hidden_dim / num_heads
         bytes_per_weight = self.dtype_config.weight_bits / BITS_PER_BYTE
@@ -1517,8 +1516,6 @@ class LLMAnalysis:
                 f'At least one attention head required on each tensor-parallel GPU. '
                 f'num_kv_heads={num_kv_heads}, tp_size={tp_size}.'
             )
-
-        weight_memory_access = self.get_num_params_per_layer_attn() / tp_size * bytes_per_weight
 
         if is_inference:
             assert activation_recomputation == ActivationRecomputation.NONE, (
@@ -1544,29 +1541,10 @@ class LLMAnalysis:
             + seq_len * batch_size * (num_heads + 2 * num_kv_heads) * head_dim / tp_size
             * bytes_per_activation
         )
-        access_q_proj = (
-            seq_len * batch_size * hidden_dim
-            * bytes_per_activation
-            + hidden_dim * (hidden_dim / tp_size)
-            * bytes_per_weight
-            + seq_len * batch_size * (num_heads / tp_size) * head_dim
-            * bytes_per_activation
-        )
-        access_kv_proj = (
-            seq_len * batch_size * hidden_dim
-            * bytes_per_activation
-            + hidden_dim * (num_kv_heads * head_dim / tp_size)
-            * bytes_per_weight
-            + seq_len * batch_size * (num_kv_heads / tp_size) * head_dim
-            * bytes_per_activation
-        )
-        access_kv_repeat = (
-            2 * seq_len * batch_size * (num_kv_heads / tp_size) * head_dim
-            + 2 * seq_len * batch_size * (num_heads / tp_size) * head_dim
-        ) * bytes_per_activation
         access_qk_matmul = (
             seq_len * batch_size * (num_heads / tp_size) * head_dim
-            + seq_len * batch_size * (num_heads / tp_size) * head_dim
+            + seq_len * batch_size * (num_kv_heads / tp_size) * head_dim 
+            * num_kv_groups
             + batch_size * (num_heads / tp_size) * seq_len * seq_len
         ) * bytes_per_activation
         access_softmax = (
@@ -1577,7 +1555,8 @@ class LLMAnalysis:
         ) * bytes_per_activation
         access_sv_matmul = (
             batch_size * (num_heads / tp_size) * seq_len * seq_len
-            + seq_len * batch_size * (num_heads / tp_size) * head_dim
+            + seq_len * batch_size * (num_kv_heads / tp_size) * head_dim 
+            * num_kv_groups
             + seq_len * batch_size * (num_heads / tp_size) * head_dim
         ) * bytes_per_activation
         access_o_proj = (
@@ -1589,23 +1568,133 @@ class LLMAnalysis:
             * bytes_per_activation
         )
 
-        if is_forward:
-            memory_access = (
-                access_linear_qkv if linear_qkv else (
-                    access_q_proj
-                    + 2 * access_kv_proj
-                )
-                + access_kv_repeat if num_kv_heads < num_heads else 0
-                + access_qk_matmul 
-                + access_softmax
-                + access_softmax_dropout
-                + access_sv_matmul
-                + access_o_proj
-            )
-        else:
-            pass
+        memory_access = (
+            access_linear_qkv
+            + access_qk_matmul 
+            + access_softmax
+            + access_softmax_dropout
+            + access_sv_matmul
+            + access_o_proj
+        )
 
         return memory_access
+    
+    def get_memory_access_bwd_per_layer_attn(
+        self,
+        batch_size: int,
+        seq_len: int,
+        is_inference: bool = True,
+        linear_qkv: bool = True,
+        flash_attn: bool = True,
+        softmax_dropout: bool = False,
+        attn_dropout: bool = True,
+        activation_recomputation:
+        ActivationRecomputation = ActivationRecomputation.NONE,
+        master_weights_dtype_bytes: int = BYTES_FP32,
+    ) -> float:
+        tp_size = self.parallelism_config.tp_size
+        sp_size = self.parallelism_config.sp_size
+        num_heads = self.model_config.n_head
+        num_kv_heads = self.model_config.num_key_value_heads
+        num_kv_groups = self.model_config.num_key_value_groups
+        hidden_dim = self.model_config.hidden_dim
+        head_dim = hidden_dim / num_heads
+        bytes_per_weight = self.dtype_config.weight_bits / BITS_PER_BYTE
+        bytes_per_activation = self.dtype_config.activation_bits / BITS_PER_BYTE
+
+        if num_kv_heads / tp_size < 1:
+            raise ValueError(
+                f'At least one attention head required on each tensor-parallel GPU. '
+                f'num_kv_heads={num_kv_heads}, tp_size={tp_size}.'
+            )
+        
+        if tp_size > 1 and tp_size == sp_size:
+            seq_len = seq_len / sp_size
+        else:
+            raise ValueError(
+                f'Sequence parallelism is gated by tensor parallelism. '
+                f'tp_size must > 1'
+            )
+        
+        access_o_proj = (
+            # load context from forward pass (sv_matmul)
+            seq_len * batch_size * (num_heads / tp_size) * head_dim
+            * bytes_per_activation
+            # load o_proj weights
+            + hidden_dim * (hidden_dim / tp_size)
+            * bytes_per_weight
+            # load output gradients from backward pass (MLP)
+            + seq_len * batch_size * hidden_dim
+            * bytes_per_activation
+            # store context gradients
+            + seq_len * batch_size * (num_heads / tp_size) * head_dim
+            * bytes_per_activation
+            # store o_proj gradient weights
+            + hidden_dim * (hidden_dim / tp_size)
+            * master_weights_dtype_bytes
+        )
+        access_sv_matmul = (
+            # load attention probs from forward pass (softmax_dropout)
+            batch_size * (num_heads / tp_size) * seq_len * seq_len
+            # load value from forward pass (value reuse in GQA)
+            + seq_len * batch_size * (num_kv_heads / tp_size) * head_dim
+            * num_kv_groups
+            # load context gradients from backward pass (o_proj)
+            + seq_len * batch_size * (num_heads / tp_size) * head_dim
+            # store attention prob gradients
+            + batch_size * (num_heads / tp_size) * seq_len * seq_len
+            # store value gradients
+            + seq_len * batch_size * (num_kv_heads / tp_size) * head_dim
+        ) * bytes_per_activation
+        # In Megatron-LM, dropout mask is generated during the forward pass.
+        # It is then recreated for the backward pass using the same RNG state,
+        # avoiding HBM storage.
+        access_softmax_dropout = (
+            # load attention probs from forward pass (softmax)
+            batch_size * (num_heads / tp_size) * seq_len * seq_len
+            # load attention prob gradients from backward pass (sv_matmul)
+            + batch_size * (num_heads / tp_size) * seq_len * seq_len 
+            # store attention prob gradients
+            + batch_size * (num_heads / tp_size) * seq_len * seq_len
+        ) * bytes_per_activation
+        access_softmax = (
+            # load attention scores from forward pass (softmax)
+            batch_size * (num_heads / tp_size) * seq_len * seq_len
+            # load attention prob gradients from backward pass (softmax_dropout) 
+            + batch_size * (num_heads / tp_size) * seq_len * seq_len
+            # store attention score gradients
+            + batch_size * (num_heads / tp_size) * seq_len * seq_len
+        ) * bytes_per_activation
+        access_qk_matmul = (
+            # load query from forward pass
+            seq_len * batch_size * (num_heads / tp_size) * head_dim
+            # load key from forward pass (key reuse in GQA)
+            + seq_len * batch_size * (num_kv_heads / tp_size) * head_dim
+            * num_kv_groups
+            # load attention score gradients from backward pass (softmax)
+            + batch_size * (num_heads / tp_size) * seq_len * seq_len
+            # store query gradients
+            + seq_len * batch_size * (num_heads / tp_size) * head_dim
+            # store key gradients
+            + seq_len * batch_size * (num_kv_heads / tp_size) * head_dim
+        ) * bytes_per_activation
+        access_linear_qkv = (
+            # load input from forward pass
+            seq_len * batch_size * hidden_dim
+            * bytes_per_activation
+            # load qkv weights
+            + (num_heads + 2 * num_kv_heads) * head_dim / tp_size * hidden_dim  
+            * bytes_per_weight
+            # load qkv gradients from backward pass (qk_matmul & sv_matmul)
+            + seq_len * batch_size * (num_heads + 2 * num_kv_heads) * head_dim / tp_size
+            * bytes_per_activation
+            # store input gradients
+            + seq_len * batch_size * hidden_dim
+            * bytes_per_activation
+            # store linear_qkv weight gradients
+            + (num_heads + 2 * num_kv_heads) * head_dim / tp_size * hidden_dim
+            * master_weights_dtype_bytes
+        )
     
     def get_memory_access_per_layer_mlp(
         self,
